@@ -109,6 +109,13 @@ class Planner:
                 {"original": origin_text(p["scheme"], p["host"], p["port"]), "url": p["url"], "source": "published"}
                 for p in published
             ]
+            # And the app's own origin, for the absolute links its pages make
+            # to itself, unless it is also a service the app calls, whose VIP
+            # publishes it.
+            app_url = urlsplit(app["url"])
+            app_origin = origin_text(app_url.scheme, app_url.hostname, app_url.port or (443 if app_url.scheme == "https" else 80))
+            if all(r["original"] != app_origin for r in rewrite):
+                rewrite.append({"original": app_origin, "url": f"https://{names[APP_VIP]}", "source": "app"})
             app_vip = as3.AppVip(
                 ip=ips[APP_VIP],
                 certificate_path=(

@@ -30,7 +30,13 @@ async def test_a_plan_reserves_names_certifies_renders_and_dry_runs(harness):
         ("https://api.payroll.corp.internal:8443", "new"),
         ("http://reports.corp.internal:8080", "new"),
         ("https://hr.corp.internal", "published"),
+        ("https://payroll.corp.internal", "app"),
     ]
+    assert plan["rewrite"][-1]["url"] == "https://payroll.example.com"
+    rules = plan["declaration"]["declaration"][plan["partition"]]["app"]["rewrite_app"]["uriRules"]
+    assert rules[-1] | {"type": None} == {
+        "type": None, "leftValue": "https://payroll.corp.internal/", "rightValue": "https://payroll.example.com/",
+    }
     assert {r["name"]: r["target"] for r in plan["dns_records"]} == {
         "api-payroll.example.com": "203.0.113.1",
         "api-payroll-8443.example.com": "203.0.113.1",
@@ -76,6 +82,15 @@ async def test_the_same_plan_again_issues_nothing(harness):
     issued = len(harness.dns.issued)
     await harness.planner.plan(planning([[A]], version=2))
     assert len(harness.dns.issued) == issued
+
+
+async def test_a_service_on_the_app_origin_fails_the_names_for_now(harness):
+    # It would share the app's public name: open question 1. Once that is
+    # settled, the rewrite map keeps the service's entry, not the app's.
+    own = service("svc_own", "payroll.corp.internal", ips=("10.20.0.9",))
+    await harness.planner.plan(planning([[A], [own]]))
+    [result] = harness.reporter.results
+    assert (result["outcome"], result["step"]) == ("failed", "names")
 
 
 async def test_two_origins_with_one_name_fail_the_plan(harness):
