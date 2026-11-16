@@ -1,20 +1,21 @@
-"""What the agent does for an exposure in `planning` and in `cancelling`
-(docs/exposure-design.md, Order of execution, step 1, and Lifecycle).
+"""What the agent does for an exposure in `planning` (docs/exposure-design.md,
+Order of execution, step 1).
 
 Planning reserves one IP per VIP, requests and installs each VIP's
 certificate, renders the AS3 declaration and dry-runs it. Every step reuses
 what the exposure already holds, so planning again, after a restart, a retry
 or a change to the grouping, reserves nothing twice: a group keeps its IP
 while it exists, a VIP keeps its certificate while its names are unchanged,
-and what is no longer needed is released. Cancelling releases all of it.
+and what is no longer needed is released. The plan is kept in the agent's
+record under its hash: it is what the agent deploys once an admin confirms
+that hash. Deploying and cancelling are in deployer.py.
 """
 import difflib
+import hashlib
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from . import as3
@@ -23,47 +24,18 @@ from .backend import Reporter
 from .config import Settings
 from .naming import NamingError, origin_text, public_name
 from .state import HeldCertificate, State
+from .steps import Run, StepFailed
 
 logger = logging.getLogger(__name__)
 
 APP_VIP = "app"
 
 
-class StepFailed(Exception):
-    def __init__(self, step: str, message: str):
-        super().__init__(message)
-        self.step = step
-
-
-@dataclass
-class _Run:
-    """One phase of one exposure: its id, the version it is for, and the
-    reports it sends."""
-
-    exposure_id: str
-    version: int
-    reporter: Reporter
-    state: State
-
-    async def report(self, step: str, state: str, message: Optional[str] = None, detail: Optional[dict] = None) -> None:
-        self.state.record_step(self.exposure_id, self.version, step, state)
-        await self.reporter.step(
-            self.exposure_id, self.state.next_seq(self.exposure_id), self.version, step, state, message, detail
-        )
-
-    @asynccontextmanager
-    async def step(self, name: str) -> AsyncIterator[dict[str, Any]]:
-        """Report the step started, then done with whatever the body puts in
-        the yielded dict as its message and detail, or failed."""
-        await self.report(name, "started")
-        outcome: dict[str, Any] = {}
-        try:
-            yield outcome
-        except StepFailed:
-            raise
-        except Exception as e:  # noqa: BLE001 - any failure fails the step, with its message
-            raise StepFailed(name, f"{type(e).__name__}: {e}") from e
-        await self.report(name, "done", outcome.get("message"), outcome.get("detail"))
+def plan_hash(plan: dict[str, Any]) -> str:
+    """sha256 of the plan's canonical JSON, as the backend computes it: the
+    hash an admin confirms, and the one a deploy names."""
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _partition(settings: Settings, app_id: str) -> str:
@@ -79,22 +51,23 @@ class Planner:
     async def plan(self, item: dict[str, Any]) -> bool:
         """Plan an exposure in `planning`; report its plan, or the step that
         failed. Returns whether the backend applied the result."""
-        run = _Run(item["id"], item["version"], self.reporter, self.state)
+        run = Run(item["id"], item["version"], self.reporter, self.state)
         try:
             plan = await self._plan(run, item["planning"])
         except StepFailed as failed:
             logger.warning("Planning %s v%d failed at %s: %s", run.exposure_id, run.version, failed.step, failed)
-            await run.report(failed.step, "failed", str(failed))
-            return await self.reporter.result(
-                run.exposure_id, run.version, "planning", "failed", step=failed.step, message=str(failed)
-            )
+            return await run.fail(failed, "planning")
+        self.state.hold_plan(run.exposure_id, run.version, plan_hash(plan), plan)
         return await self.reporter.result(run.exposure_id, run.version, "planning", "ok", plan=plan)
 
-    async def _plan(self, run: _Run, work: dict[str, Any]) -> dict[str, Any]:
+    async def _plan(self, run: Run, work: dict[str, Any]) -> dict[str, Any]:
         app, groups, published = work["app"], work["groups"], work["published"]
         partition = _partition(self.settings, app["id"])
         deployed = await self.f5.declaration(partition)
-        existing_app = (deployed or {}).get("declaration", {}).get(partition, {}).get("app", {}).get("vs_app")
+        # What the app's earlier exposures deployed stays; its own VIP, if it
+        # has one, keeps its address and certificate and gets a new rewrite map.
+        deployed_app = (deployed or {}).get("declaration", {}).get(partition, {}).get("app", {})
+        existing_app = deployed_app.get("vs_app")
 
         async with run.step("names") as out:
             names = self._names(app, groups)
@@ -140,25 +113,34 @@ class Planner:
                 ip=ips[APP_VIP],
                 certificate_path=(
                     certificates[APP_VIP].name if APP_VIP in certificates
-                    else existing_app["serverTLS"]  # the deployed app VIP keeps its own
+                    # The deployed app VIP keeps its own, which its exposure holds.
+                    else deployed_app[existing_app["serverTLS"]]["certificates"][0]["certificate"]["bigip"]
                 ),
                 url=app["url"],
                 public_name=names[APP_VIP],
                 rewrite=tuple((r["original"], r["url"]) for r in rewrite),
             )
-            declaration = as3.render(run.exposure_id, partition, vips, app_vip)
+            declaration = as3.render(run.exposure_id, partition, vips, app_vip, keep=deployed_app)
             out["message"] = f"{len(vips)} VIPs and the app's"
 
         async with run.step("dry_run") as out:
             errors = await self.f5.dry_run(partition, declaration)
             if errors:
                 raise StepFailed("dry_run", "AS3 refused the declaration: " + "; ".join(errors))
-            diff, summary = _diff(deployed, declaration, partition)
+            diff, summary = diff_declarations(deployed, declaration, partition)
             out["message"] = f"+{summary['add']} ~{summary['change']} -{summary['destroy']}"
 
+        # Created only after the deploy verifies, so no name resolves to an IP
+        # nothing listens on. A deployed app VIP has its name already, which
+        # its own exposure holds; this one creates only its services' names.
+        dns_records = sorted(
+            ([] if existing_app else [{"name": names[APP_VIP], "type": "A", "target": ips[APP_VIP]}])
+            + [{"name": names[s["id"]], "type": "A", "target": ips[g["id"]]} for g in groups for s in g["services"]],
+            key=lambda record: record["name"],
+        )
         summary.update({
             "ips": len([k for k in ips if k != APP_VIP or not existing_app]),
-            "dns": len(names),
+            "dns": len(dns_records),
             "certificates": len(certificates),
         })
         return {
@@ -190,13 +172,7 @@ class Planner:
                 for vip in vips
             ],
             "rewrite": rewrite,
-            # Created only after the deploy verifies, so no name resolves to
-            # an IP nothing listens on.
-            "dns_records": sorted(
-                [{"name": names[APP_VIP], "type": "A", "target": ips[APP_VIP]}]
-                + [{"name": names[s["id"]], "type": "A", "target": ips[g["id"]]} for g in groups for s in g["services"]],
-                key=lambda record: record["name"],
-            ),
+            "dns_records": dns_records,
             "declaration": declaration,
             "diff": diff,
             "summary": summary,
@@ -263,31 +239,6 @@ class Planner:
             issued += 1
         return out, issued
 
-    # ---- cancelling ------------------------------------------------------------
-
-    async def cancel(self, item: dict[str, Any]) -> bool:
-        """Release everything the exposure holds, from the agent's own record."""
-        run = _Run(item["id"], item["version"], self.reporter, self.state)
-        try:
-            async with run.step("release_ips") as out:
-                held = self.state.reservations(run.exposure_id)
-                for key in held:
-                    await self.ips.release(f"{run.exposure_id}/{key}")
-                    self.state.drop_reservation(run.exposure_id, key)
-                out["message"] = ", ".join(held.values()) or "none held"
-            async with run.step("remove_certificates") as out:
-                held_certs = self.state.certificates(run.exposure_id)
-                for key, cert in held_certs.items():
-                    await self.f5.remove_certificate(cert.name)
-                    self.state.drop_certificate(run.exposure_id, key)
-                out["message"] = f"{len(held_certs)} removed"
-        except StepFailed as failed:
-            await run.report(failed.step, "failed", str(failed))
-            return await self.reporter.result(
-                run.exposure_id, run.version, "cancelling", "failed", step=failed.step, message=str(failed)
-            )
-        return await self.reporter.result(run.exposure_id, run.version, "cancelling", "ok")
-
 
 def _cert_view(cert: Optional[HeldCertificate]) -> Optional[dict[str, Any]]:
     """What the plan shows of a certificate: never its key."""
@@ -296,7 +247,7 @@ def _cert_view(cert: Optional[HeldCertificate]) -> Optional[dict[str, Any]]:
     return {"name": cert.name, "names": list(cert.names), "expires": cert.expires}
 
 
-def _diff(
+def diff_declarations(
     deployed: Optional[dict[str, Any]], declaration: dict[str, Any], partition: str
 ) -> tuple[list[dict[str, str]], dict[str, int]]:
     """The dry run's diff of the partition, unified, and how many of its

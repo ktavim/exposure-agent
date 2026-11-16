@@ -2,15 +2,15 @@
 
 The deployment agent for publishing submitted apps through the F5 BIG-IP. The design is `network-interceptor/docs/exposure-design.md`. The agent runs on the management network and is the only holder of the F5, IP reservation and DNS service credentials. It carries out what the backend approved:
 
-- **Planning:** reserve one IP per VIP, request each VIP's certificate and install it on the F5, render the AS3 declaration from the agent's own template, dry-run it, and report the plan.
-- **Cancelling:** release every reservation and certificate the exposure holds.
-- **Deploying:** deploy, verify, create the DNS records and register the published origins. Phase 5; not built yet.
+- **Planning:** reserve one IP per VIP, request each VIP's certificate and install it on the F5, render the AS3 declaration from the agent's own template, dry-run it, and report the plan. The agent keeps the plan under its hash.
+- **Deploying:** carry out the plan an admin confirmed, found by its hash: recheck the reservations and the dry-run diff, post the declaration, verify the virtual servers, the pools and the app's rewriting, and create the DNS records. The backend registers the published origins when it hears the deploy succeeded. A retry resumes from the step that failed.
+- **Cancelling:** undo what the exposure did, in reverse: delete its DNS records, restore the partition's previous declaration, remove its certificates, release its reservations.
 
 The agent pulls: it polls the backend's `/api/agent/*` endpoints for what is waiting, reports each step, and reports the outcome for the version it worked on. The backend never calls the agent.
 
 ## Status
 
-Phase 4, with **fake adapters** only. The IP reservation service, the DNS service and the F5 are in-memory stand-ins (`agent/adapters/fake.py`) until their APIs are known: open questions 2, 3 and 6 in the design. The public DNS names follow a placeholder rule (`agent/naming.py`) until open question 1 is settled. The AS3 rewrite profile is illustrative until open question 4.
+Phase 5, with **fake adapters** only. The IP reservation service, the DNS service, the F5 and the probe that fetches a page through a VIP are in-memory stand-ins (`agent/adapters/fake.py`) until their APIs are known: open questions 2, 3 and 6 in the design. The public DNS names follow a placeholder rule (`agent/naming.py`) until open question 1 is settled. The AS3 rewrite profile is illustrative until open question 4.
 
 There is no authentication yet. Phase 6 adds a Keycloak token for the `exposure-agent` client, obtained with a signed JWT.
 
@@ -49,9 +49,11 @@ pytest
 agent/config.py        settings from the environment
 agent/backend.py       the backend's agent API
 agent/runner.py        the poll loop
-agent/planner.py       planning and cancelling, step by step
+agent/steps.py         a phase as reported steps, and the step log
+agent/planner.py       planning, step by step
+agent/deployer.py      deploying and cancelling, step by step
 agent/as3.py           the AS3 template
 agent/naming.py        public DNS names (placeholder rule)
-agent/state.py         the agent's own record: holdings, step log, report numbers
+agent/state.py         the agent's own record: holdings, plans, previous declarations, step log, report numbers
 agent/adapters/        the services' interfaces, and the fakes
 ```

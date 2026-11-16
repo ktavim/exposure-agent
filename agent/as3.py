@@ -12,16 +12,23 @@ One partition (tenant) per app, one application in it:
 - the app's own VIP, whose rewrite profile replaces each original origin in
   the app's responses with the URL that publishes it.
 
+AS3 declares a partition whole: what a declaration leaves out is removed. So
+an app's later exposure keeps the VIPs its earlier ones deployed, passed in
+as `keep`, and re-renders only the app's VIP, whose rewrite map it replaces.
+
 How the F5 rewrites is open question 4: the rewrite profile here is in
 URI-translation mode, and its exact properties depend on the AS3 version in
 use (question 6). The structure is what the console and the dry run need now.
 """
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 SCHEMA_VERSION = "3.50.0"
+
+# The objects of the app's own VIP, which each exposure renders afresh.
+APP_VIP_OBJECTS = frozenset({"pool_app", "tls_to_app", "tls_app", "rewrite_app", "vs_app"})
 
 
 @dataclass(frozen=True)
@@ -65,8 +72,15 @@ def _pool(service: PoolService) -> dict[str, Any]:
     return pool
 
 
-def render(exposure_id: str, partition: str, vips: list[Vip], app: AppVip) -> dict[str, Any]:
+def render(
+    exposure_id: str, partition: str, vips: list[Vip], app: AppVip, keep: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """The partition's declaration: `keep`, the objects already deployed
+    there that are not the app VIP's, then this exposure's VIPs and the app's."""
     application: dict[str, Any] = {"class": "Application"}
+    for name, item in (keep or {}).items():
+        if name != "class" and name not in APP_VIP_OBJECTS:
+            application[name] = item
 
     for vip in vips:
         vs, tls, policy = object_name("vs_", vip.key), object_name("tls_", vip.key), object_name("route_", vip.key)

@@ -1,73 +1,11 @@
-"""Planning and cancelling with the fake adapters: what the agent reserves,
-issues, renders and reports, and that planning again reuses what it holds."""
+"""Planning with the fake adapters: what the agent reserves, issues, renders
+and reports, and that planning again reuses what it holds."""
 import json
-from typing import Any, Optional
 
-import pytest
-
-from agent.adapters.fake import FakeDnsService, FakeF5, FakeIpReservations
-from agent.config import Settings
-from agent.planner import Planner
+from agent.planner import plan_hash
 from agent.runner import Agent
-from agent.state import State
 
-
-class Recorder:
-    """Stands in for the backend: records steps and results, applies every result."""
-
-    def __init__(self) -> None:
-        self.steps: list[dict[str, Any]] = []
-        self.results: list[dict[str, Any]] = []
-
-    async def step(self, exposure_id, seq, version, step, state, message=None, detail=None) -> None:
-        self.steps.append({"exposure_id": exposure_id, "seq": seq, "version": version, "step": step, "state": state, "message": message})
-
-    async def result(self, exposure_id, version, phase, outcome, plan=None, step=None, message=None) -> bool:
-        self.results.append({"exposure_id": exposure_id, "version": version, "phase": phase, "outcome": outcome,
-                             "plan": plan, "step": step, "message": message})
-        return True
-
-
-def service(id: str, host: str, *, scheme="https", port=443, ips=("10.20.0.1",), auth="bearer") -> dict:
-    return {"id": id, "scheme": scheme, "host": host, "port": port, "auth_method": auth, "ips": list(ips)}
-
-
-def planning(groups: list[list[dict]], *, exposure_id="exp_1", version=1, published=()) -> dict:
-    return {
-        "id": exposure_id,
-        "status": "planning",
-        "version": version,
-        "planning": {
-            "app": {"id": "app_payroll", "name": "Payroll", "url": "https://payroll.corp.internal"},
-            "groups": [{"id": f"grp_{i}", "services": g} for i, g in enumerate(groups)],
-            "published": list(published),
-        },
-    }
-
-
-@pytest.fixture
-def harness(tmp_path):
-    class Harness:
-        def __init__(self) -> None:
-            self.settings = Settings(state_path=str(tmp_path / "state.sqlite3"), vip_ranges=("203.0.113.0/29",))
-            self.ips, self.dns, self.f5 = FakeIpReservations(), FakeDnsService(), FakeF5()
-            self.reporter = Recorder()
-            self.restart()
-
-        def restart(self) -> None:
-            """A new agent process on the same state file and services."""
-            self.state = State(self.settings.state_path)
-            self.planner = Planner(self.settings, self.state, self.ips, self.dns, self.f5, self.reporter)
-
-        def last_plan(self) -> Optional[dict]:
-            return self.reporter.results[-1]["plan"]
-
-    return Harness()
-
-
-A = service("svc_a", "api.payroll.corp.internal")
-A8443 = service("svc_a8443", "api.payroll.corp.internal", port=8443, ips=("10.20.0.1", "10.20.0.2"))
-R = service("svc_r", "reports.corp.internal", scheme="http", port=8080)
+from .conftest import A, A8443, R, planning, service
 
 
 async def test_a_plan_reserves_names_certifies_renders_and_dry_runs(harness):
@@ -157,16 +95,11 @@ async def test_an_exhausted_range_fails_at_reserving(harness):
     assert "no free address" in result["message"]
 
 
-async def test_cancelling_releases_everything_held(harness):
-    await harness.planner.plan(planning([[A], [R]]))
-    harness.restart()
-    assert await harness.planner.cancel({"id": "exp_1", "status": "cancelling", "version": 2, "cancelling": {}})
-    assert harness.reporter.results[-1] | {"plan": None} == {
-        "exposure_id": "exp_1", "version": 2, "phase": "cancelling", "outcome": "ok",
-        "plan": None, "step": None, "message": None,
-    }
-    assert harness.ips.held == {} and harness.f5.certificates == {}
-    assert harness.state.reservations("exp_1") == {} and harness.state.certificates("exp_1") == {}
+async def test_the_plan_is_kept_under_its_hash(harness):
+    plan = await harness.planned(planning([[A]]))
+    assert harness.state.plan("exp_1", plan_hash(plan)) == plan
+    # The hash survives the trip through JSON, as the backend computes it.
+    assert plan_hash(json.loads(json.dumps(plan))) == plan_hash(plan)
 
 
 async def test_the_agent_works_through_what_is_pending(harness):
@@ -174,9 +107,12 @@ async def test_the_agent_works_through_what_is_pending(harness):
         async def pending(self):
             return [
                 planning([[A]], exposure_id="exp_1"),
-                {"id": "exp_2", "status": "deploying", "version": 1, "deploying": {}},
+                {"id": "exp_2", "status": "deploying", "version": 1, "deploying": {"plan_hash": "sha256:unknown"}},
+                {"id": "exp_3", "status": "cancelling", "version": 2, "cancelling": {}},
             ]
 
-    agent = Agent(harness.planner, Backend(), poll_interval_s=0)
-    assert await agent.tick() == 1  # deploying waits for phase 5
-    assert [r["exposure_id"] for r in harness.reporter.results] == ["exp_1"]
+    agent = Agent(harness.planner, harness.deployer, Backend(), poll_interval_s=0)
+    assert await agent.tick() == 3
+    assert [(r["exposure_id"], r["phase"], r["outcome"]) for r in harness.reporter.results] == [
+        ("exp_1", "planning", "ok"), ("exp_2", "deploying", "failed"), ("exp_3", "cancelling", "ok"),
+    ]

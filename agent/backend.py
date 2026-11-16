@@ -20,6 +20,7 @@ class Reporter(Protocol):
     async def result(
         self, exposure_id: str, version: int, phase: str, outcome: str,
         plan: Optional[dict[str, Any]] = None, step: Optional[str] = None, message: Optional[str] = None,
+        deployment: Optional[dict[str, Any]] = None,
     ) -> bool: ...
 
 
@@ -48,11 +49,15 @@ class BackendClient:
     async def result(
         self, exposure_id: str, version: int, phase: str, outcome: str,
         plan: Optional[dict[str, Any]] = None, step: Optional[str] = None, message: Optional[str] = None,
+        deployment: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Report a phase's outcome; False when the backend dropped it as stale."""
         response = await self._http.post(
             f"/api/agent/exposures/{exposure_id}/result",
-            json={"version": version, "phase": phase, "outcome": outcome, "plan": plan, "step": step, "message": message},
+            json={
+                "version": version, "phase": phase, "outcome": outcome, "plan": plan,
+                "deployment": deployment, "step": step, "message": message,
+            },
         )
         response.raise_for_status()
         return bool(response.json()["applied"])

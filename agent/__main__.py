@@ -5,6 +5,7 @@ import sys
 
 from .backend import BackendClient
 from .config import Settings
+from .deployer import Deployer
 from .planner import Planner
 from .runner import Agent
 from .state import State
@@ -16,16 +17,18 @@ async def main() -> int:
     if settings.adapters != "fake":
         print(f"AGENT_ADAPTERS={settings.adapters!r}: only the fake adapters exist so far", file=sys.stderr)
         return 2
-    from .adapters.fake import FakeDnsService, FakeF5, FakeIpReservations
+    from .adapters.fake import FakeDnsService, FakeF5, FakeIpReservations, FakeProbe
 
     state = State(settings.state_path)
     backend = BackendClient(settings.backend_url)
-    planner = Planner(settings, state, FakeIpReservations(), FakeDnsService(), FakeF5(), backend)
+    ips, dns, f5 = FakeIpReservations(), FakeDnsService(), FakeF5()
+    planner = Planner(settings, state, ips, dns, f5, backend)
+    deployer = Deployer(settings, state, ips, dns, f5, FakeProbe(f5), backend)
     logging.getLogger(__name__).info(
         "Agent polling %s every %.0fs, with fake adapters", settings.backend_url, settings.poll_interval_s
     )
     try:
-        await Agent(planner, backend, settings.poll_interval_s).run()
+        await Agent(planner, deployer, backend, settings.poll_interval_s).run()
     finally:
         await backend.close()
         state.close()
